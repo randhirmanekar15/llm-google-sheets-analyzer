@@ -36,25 +36,42 @@ def load_sheet(sheet_id: str, creds_path: str) -> pd.DataFrame:
     import gspread
     from google.oauth2.service_account import Credentials
 
-    creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
-    client = gspread.authorize(creds)
-    records = client.open_by_key(sheet_id).sheet1.get_all_records()
+    try:
+        creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
+        client = gspread.authorize(creds)
+        records = client.open_by_key(sheet_id).sheet1.get_all_records()
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Service-account file not found: {creds_path}") from exc
+    except Exception as exc:  # noqa: BLE001  auth/API failures surfaced cleanly
+        raise RuntimeError(
+            f"Failed to load Google Sheet '{sheet_id}'. Check credentials, API "
+            "access, and that the sheet is shared with the service account."
+        ) from exc
     return pd.DataFrame(records)
 
 
 def query_llm(prompt: str) -> str:
     """Send a prompt to the local Ollama model."""
-    response = requests.post(
-        OLLAMA_URL,
-        json={"model": MODEL, "prompt": prompt, "stream": False},
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={"model": MODEL, "prompt": prompt, "stream": False},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Failed to reach Ollama at {OLLAMA_URL}. Is the daemon running?"
+        ) from exc
     return response.json().get("response", "")
 
 
 def analyze(df: pd.DataFrame, metric: str, top_n: int = 10) -> str:
     """Sort deterministically, then ask the LLM only to find patterns."""
+    if metric not in df.columns:
+        raise ValueError(
+            f"Metric column '{metric}' not found. Available columns: {list(df.columns)}"
+        )
     top = df.sort_values(by=metric, ascending=False).head(top_n)
     prompt = (
         f"You are a data analyst. Below are the top {top_n} rows by {metric}.\n"
@@ -66,6 +83,10 @@ def analyze(df: pd.DataFrame, metric: str, top_n: int = 10) -> str:
 
 
 def main() -> None:
+    missing = [v for v in ("SHEET_ID", "GSHEET_CREDS") if not os.environ.get(v)]
+    if missing:
+        raise SystemExit(f"Missing required environment variables: {', '.join(missing)}")
+
     sheet_id = os.environ["SHEET_ID"]
     creds_path = os.environ["GSHEET_CREDS"]
     metric = os.environ.get("METRIC", "Hours Viewed")
